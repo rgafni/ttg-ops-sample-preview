@@ -1,0 +1,4 @@
+Built from rgafni/ttg-ops commit 82e93404bc2dea6e65c3c4acda06d1ded3dca859 (PR #1, unmerged).
+Copied unchanged: app.css billing-core.js model.js fixtures/v4-sample.js fixtures/fake-api.js icons/icon-192.png icons/apple-touch-icon.png .nojekyll
+Test harness copied with neutral example.invalid URLs.
+Preview-only changes: app.js (always fictional, no backend/key/storage/service worker), boot.js (layout only), index.html (no config/manifest/installer, CSP connect-src none).

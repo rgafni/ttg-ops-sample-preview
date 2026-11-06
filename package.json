@@ -1,0 +1,1 @@
+{ "name": "ttg-ops-sample-preview", "private": true, "type": "module", "scripts": { "test": "node tests/preview.test.mjs" } }
