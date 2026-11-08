@@ -79,6 +79,32 @@ test('index.html: every asset is relative and exists (works under a /<repo>/ sub
 });
 test('syntax: every JS file parses', () => { for (const f of walk(root).filter(f => /\.js$/.test(f))) new vm.Script(read(f), { filename: f }); });
 
+test('student preview: exactly seven sections with two fictional case authorizations and no field dump', async () => {
+  const t = boot({ preloadFixtures: true }); await flush();
+  const a = t.app.S.P.students.find(x => x.name === 'Avery Demo'); await t.go('#/student/' + a.id); await flush();
+  const sections = [...t.html.matchAll(/data-section="([^"]+)"/g)].map(x => x[1]);
+  assert.deepStrictEqual(sections, ['Child info', 'Cases', 'Providers', 'Schedule', 'Billing', 'Documents', 'Clinical Data']);
+  assert.match(t.html,/DEMO-CASE-OT-01/); assert.match(t.html,/DEMO-CASE-SLP-02/); assert.match(t.html,/Authorized hours/); assert.match(t.html,/Authorized units/);
+  assert.match(t.html,/\$50\/hour \(fictional\)/); assert.match(t.html,/DEMO-OSIS-0001/);
+  assert.doesNotMatch(t.html.replace(/<details[\s\S]*?<\/details>/g,''),/Hours &amp; key dates|Hours & key dates|Not on file|Last contact:/);
+  assert.doesNotMatch(t.html,/data-act="bill-|data-change="bill-check"/);
+});
+test('provider preview: five sections, SSN masked only, sample rate/documents, read-only billing', async () => {
+  const t = boot({ preloadFixtures: true, key: KEY }); await flush();
+  const p = t.app.S.P.providers.find(x => x.name === 'Jamie Fern'); await t.go('#/provider/' + p.key); await flush();
+  const sections = [...t.html.matchAll(/data-section="([^"]+)"/g)].map(x => x[1].replace(/&amp;/g,'&'));
+  assert.deepStrictEqual(sections, ['Provider info', 'Case roster & schedule', 'Billing sheets', 'Documents', 'Clinical data']);
+  assert.match(t.html,/\*\*\*-\*\*-0042/); assert.doesNotMatch(t.html,/000-00-0042|000000042|Not on file|data-act="bill-/);
+  assert.match(t.html,/\$40\/hour \(fictional\)/); assert.match(t.html,/Fictional credential record/);
+  assert.doesNotMatch(JSON.stringify(t.app.S.P),/000-00-0042|000000042/);
+  assert.deepStrictEqual(t.setItems, []); assert.equal(t.fetches.length,0);
+});
+test('every student/provider sample record omits empty rows and has only the requested top-level sections', async () => {
+  const t = boot({ preloadFixtures: true }); await flush();
+  for (const s of t.app.S.P.students) { await t.go('#/student/' + s.id); await flush(); assert.equal([...t.html.matchAll(/data-section=/g)].length,7); assert.doesNotMatch(t.html,/Not on file|Hours &amp; key dates/); }
+  for (const p of t.app.S.P.providers) { await t.go('#/provider/' + p.key); await flush(); assert.equal([...t.html.matchAll(/data-section=/g)].length,5); assert.doesNotMatch(t.html,/Not on file/); }
+});
+
 let pass = 0, fail = 0;
 for (const [n, f] of tests) { try { await f(); pass++; console.log('ok ' + n); } catch (e) { fail++; console.log('FAIL ' + n + '\n  ' + (e && e.message)); } }
 console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);
