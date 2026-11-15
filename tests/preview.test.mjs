@@ -105,6 +105,14 @@ test('calendar preview: week view with overlaps and mandate check, fictional onl
   assert.match(t.html,/Overlaps Riley Fixture/); assert.match(t.html,/mandate 4 h/); assert.match(t.html,/class="day-strip"/);
   assert.deepStrictEqual(t.setItems, []); assert.equal(t.fetches.length,0);
 });
+test('pass 2 preview: plain billing wording, calendar labels for screen readers, honest other weeks', async () => {
+  const t = boot({ preloadFixtures: true }); await flush();
+  const out = await allRoutes(t);
+  for (const [r, h] of Object.entries(out)) { if (!r.startsWith('#/billing/')) continue; assert.doesNotMatch(h, /line\(s\)/, r); }
+  await t.go('#/providers'); assert.match(t.html, /<span class="sr">Mon /);
+  await t.act('cal-week', { 'data-d': '-1' }); assert.match(t.html, /today\u2019s schedule on a past week/);
+  assert.match(read('index.html'), /<main id="view"><\/main>/);
+});
 test('every student/provider sample record omits empty rows and has only the requested top-level sections', async () => {
   const t = boot({ preloadFixtures: true }); await flush();
   for (const s of t.app.S.P.students) { await t.go('#/student/' + s.id); await flush(); assert.equal([...t.html.matchAll(/data-section=/g)].length,7); assert.doesNotMatch(t.html,/Not on file|Hours &amp; key dates/); }
