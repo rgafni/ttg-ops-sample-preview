@@ -108,6 +108,16 @@
     return hits.length === 1 ? hits[0] : null;
   }
 
+  /** What an open item is about. A subject that is only a rule code ("T5 – Name") is replaced by the start of the item's own message. */
+  function itemTitle(q, trig) {
+    var sub = str(q.subject), code = str(q.trigger), msg = str(q.message).replace(/^\[[^\]]*\]\s*/, '').replace(/\s+/g, ' ');
+    var bare = !sub || (code && !trig[code] && (sub === code || sub.indexOf(code + ' ') === 0));
+    if (!bare) return sub;
+    var m1 = msg.match(/^.*?[.!?](?=\s|$)/), first = m1 ? m1[0] : msg;
+    var who = str(q.recipient), stu = str(q.student);
+    return excerpt(first, 70) || excerpt(str(q.note), 70) || (who ? 'Draft to ' + who + (stu && who.indexOf(stu.split(' ')[0]) < 0 ? ' about ' + stu : '') : '') || 'Open item';
+  }
+
   /* ---------- bootstrap -> view model ---------- */
   function normalizeBootstrap(b) {
     b = b || {};
@@ -119,7 +129,8 @@
       var p = findProvider(providers, q.recipient);
       return { id: str(q.id), created: str(q.created), trigger: str(q.trigger), triggerName: trig[q.trigger] || str(q.trigger), case_id: str(q.case_id), student: str(q.student),
         recipient: str(q.recipient), contact: str(q.recipient_contact), channel: str(q.channel), subject: str(q.subject), message: str(q.message),
-        status: str(q.status) || 'draft', updated: str(q.updated), note: str(q.note), owner: str(q.owner) || 'Roni', open_role: str(q.open_role), providerKey: p ? p.key : '' };
+        status: str(q.status) || 'draft', updated: str(q.updated), note: str(q.note), owner: str(q.owner) || 'Roni', open_role: str(q.open_role), providerKey: p ? p.key : '',
+        title: itemTitle(q, trig) };
     });
     var idCount = {}, nameGroups = {};
     cases.forEach(function (c) { idCount[c.id] = (idCount[c.id] || 0) + 1; var k = normName(c.student); (nameGroups[k] = nameGroups[k] || []).push(c.id); });
@@ -178,15 +189,22 @@
 
   /* ---------- clinical notes ---------- */
   function normalizeClinical(c, P) {
-    if (!c || !c.available) return { available: false, reason: str(c && c.reason) || 'Clinical notes source not connected', notes: [], sessions: [], unmatched: 0 };
+    if (!c || !c.available) return { available: false, reason: str(c && c.reason) || 'Clinical notes source not connected', notes: [], unlinked: [], sessions: [], unmatched: 0 };
     var notes = (c.notes || []).map(function (n) {
       var p = findProvider(P && P.providers, n.provider);
       return { id: str(n.id), case_id: str(n.case_id), student: str(n.student), date: BC.isoDate(n.date), time: str(n.time), duration_min: n.duration_min == null ? null : +n.duration_min,
         provider: str(n.provider), providerKey: p ? p.key : 'p' + hkey('n:' + normName(n.provider)), service: str(n.service), location: str(n.location), text: str(n.text),
         signed: str(n.signed), created: str(n.created), source: str(n.source) || 'Clinical notes' };
     }).sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : (a.time < b.time ? 1 : -1); });
+    // Notes the API could not attach to exactly one student. Kept apart, never linked by guesswork; shown with the name as written.
+    var unlinked = (c.unlinked_notes || []).map(function (n) {
+      var p = findProvider(P && P.providers, n.provider);
+      return { id: str(n.id), case_id: '', student: str(n.student), date: BC.isoDate(n.date), time: str(n.time), duration_min: n.duration_min == null ? null : +n.duration_min,
+        provider: str(n.provider), providerKey: p ? p.key : 'p' + hkey('n:' + normName(n.provider)), service: str(n.service), location: str(n.location), text: str(n.text),
+        signed: str(n.signed), created: str(n.created), source: str(n.source) || 'Clinical notes', unlinked: true, reason: str(n.reason) };
+    }).sort(function (a, b) { return a.date < b.date ? 1 : a.date > b.date ? -1 : 0; });
     var ss = c.sessions_without_notes || {};
-    return { available: true, reason: '', notes: notes, unmatched: c.unmatched_count || 0, ambiguous: c.ambiguous_count || 0,
+    return { available: true, reason: '', notes: notes, unlinked: unlinked, unmatched: c.unmatched_count || 0, ambiguous: c.ambiguous_count || 0,
       sessions: ss.available ? (ss.items || []).map(function (s) { return { case_id: str(s.case_id), student: str(s.student), date: BC.isoDate(s.date), provider: str(s.provider), service: str(s.service), source: str(s.source) }; }) : [],
       sessionsAvailable: !!ss.available, sessionsReason: str(ss.reason) };
   }
@@ -257,20 +275,141 @@
     };
   }
 
+  /* ---------- schedules -> calendar ----------
+     Schedules are the free-text strings already on the assignments ("Mon-Fri 3:00-5:00 PM; Sat 10:00 AM-12:00 PM (virtual sup.)").
+     They are parsed strictly. Anything that does not parse is reported back as text, never guessed onto the calendar.
+     A scheduled slot is a plan, not proof of a session; a missing note is never treated as a missed session. */
+  var DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'], DAY_LABEL = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  function dayIndex(t) { t = str(t).toLowerCase().slice(0, 3); var i = DAYS.indexOf(t); return i; }
+  function parseDays(spec) {
+    // "Mon", "Mon-Fri", "Mon/Wed", "Tue & Thu", "Mon, Wed"
+    var out = [], parts = str(spec).split(/\s*(?:\/|,|&|\band\b)\s*/i).filter(Boolean);
+    for (var i = 0; i < parts.length; i++) {
+      var r = parts[i].match(/^([A-Za-z]{3,9})\s*(?:-|–|to)\s*([A-Za-z]{3,9})$/);
+      if (r) {
+        var a = dayIndex(r[1]), b = dayIndex(r[2]); if (a < 0 || b < 0) return null;
+        for (var d = a, n = 0; n < 7; d = (d + 1) % 7, n++) { out.push(d); if (d === b) break; }
+      } else { var x = dayIndex(parts[i]); if (x < 0 || !/^[A-Za-z]{3,9}\.?$/.test(parts[i])) return null; out.push(x); }
+    }
+    return out.length ? out : null;
+  }
+  function clock(h, m, ap) { h = +h; m = +(m || 0); if (h > 23 || m > 59) return null; if (ap) { ap = ap.toLowerCase(); if (h === 12) h = 0; if (ap === 'pm') h += 12; } return h * 60 + m; }
+  function parseRange(t) {
+    var m = str(t).match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:-|–|to)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/i);
+    if (!m) return null;
+    var end = clock(m[4], m[5], m[6]), start;
+    if (m[3]) start = clock(m[1], m[2], m[3]);
+    else {
+      start = clock(m[1], m[2], m[6]);
+      // "11:00-1:00 PM" crosses noon. Only a 7 to 11 morning start is read that way; anything else stays unparsed.
+      if (start != null && end != null && start > end) start = m[6].toLowerCase() === 'pm' && +m[1] >= 7 && +m[1] <= 11 ? clock(m[1], m[2], 'am') : null;
+    }
+    if (start == null || end == null || end <= start) return null;
+    return { start: start, end: end };
+  }
+  function parseSchedule(text) {
+    var slots = [], unparsed = [];
+    str(text).split(/\s*;\s*/).filter(Boolean).forEach(function (seg) {
+      var note = '', s = seg.replace(/\(([^)]*)\)/g, function (_, n) { note += (note ? '; ' : '') + n.trim(); return ' '; }).replace(/\s+/g, ' ').trim();
+      var m = s.match(/^([A-Za-z]{3,9}\.?(?:\s*(?:-|–|\/|,|&|to|and)\s*[A-Za-z]{3,9}\.?)*)\s+(\d.*)$/i);
+      var days = m && parseDays(m[1].replace(/\./g, ''));
+      if (!days) { unparsed.push(seg); return; }
+      // several ranges on one day, each with its own note: "8:00 AM-2:15 PM (school), 2:30-5:30 PM (home)"
+      var pieces = seg.slice(seg.search(/\d/)).split(/\s*,\s*/), ok = [];
+      for (var i = 0; i < pieces.length; i++) {
+        var pn = ''; var body = pieces[i].replace(/\(([^)]*)\)/g, function (_, n) { pn += (pn ? '; ' : '') + n.trim(); return ' '; }).replace(/\s+/g, ' ').trim();
+        var r = parseRange(body); if (!r) { ok = null; break; }
+        ok.push({ start: r.start, end: r.end, note: pn });
+      }
+      if (!ok) { unparsed.push(seg); return; }
+      days.forEach(function (d) { ok.forEach(function (r) { slots.push({ day: d, start: r.start, end: r.end, note: r.note }); }); });
+    });
+    return { slots: slots, unparsed: unparsed };
+  }
+  function slotMinutes(slots) { return (slots || []).reduce(function (a, s) { return a + (s.end - s.start); }, 0); }
+  function hhmm(min) { var h = Math.floor(min / 60), m = min % 60, ap = h >= 12 ? 'PM' : 'AM', h12 = h % 12 || 12; return h12 + (m ? ':' + ('0' + m).slice(-2) : '') + ' ' + ap; }
+  function timeRange(s) { var a = hhmm(s.start), b = hhmm(s.end); if (a.slice(-2) === b.slice(-2)) a = a.slice(0, -3); return a + '–' + b; }
+  function fmtHours(min) { if (min > 0 && min < 60) return Math.round(min) + ' min'; var h = Math.round(min / 6) / 10; return (h % 1 ? h.toFixed(1) : String(h)) + ' h'; }
+  function mandateMinutes(m) { var x = str(m).match(/^(\d+(?:\.\d+)?)\s*(?:h|hrs?|hours?)?(?:\s*\/\s*(?:wk|week))?$/i); return x ? Math.round(parseFloat(x[1]) * 60) : null; }
+  var SUPERVISE = /\b(bcba|supervis|sup\.?|joint|parent training)\b/i;
+  /** Weekly plan for every active assignment, with scheduled vs mandate per assignment. */
+  function weekPlan(P) {
+    return (P.schedules || []).map(function (r) {
+      var ps = parseSchedule(r.schedule), mins = slotMinutes(ps.slots), man = mandateMinutes(r.mandate);
+      return { case_id: r.case_id, student: r.student, provider: r.provider, providerKey: r.providerKey, role: r.role, open: r.open, schedule: r.schedule,
+        slots: ps.slots, unparsed: ps.unparsed, minutes: mins, mandateMin: man,
+        vsMandate: man == null || !ps.slots.length || ps.unparsed.length ? '' : mins < man - 5 ? 'under' : mins > man + 5 ? 'over' : 'match' };
+    });
+  }
+  function isoOf(d) { return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+  function parseIso(s) { var m = str(s).match(/^(\d{4})-(\d{2})-(\d{2})$/); return m ? new Date(+m[1], +m[2] - 1, +m[3], 12) : null; }
+  /** Monday of the week containing iso date. */
+  function weekStart(iso) { var d = parseIso(iso) || new Date(); d.setHours(12); var back = (d.getDay() + 6) % 7; d.setDate(d.getDate() - back); return isoOf(d); }
+  function addDays(iso, n) { var d = parseIso(iso); d.setDate(d.getDate() + n); return isoOf(d); }
+  /** Sessions planned for the 7 days from monday, with overlap flags and notes on file. opts: { monday, today, providerKey, caseId } */
+  function calendarWeek(P, clinical, opts) {
+    opts = opts || {};
+    var monday = weekStart(opts.monday || opts.today), today = opts.today || isoOf(new Date());
+    var plan = weekPlan(P), days = [];
+    var notes = clinical && clinical.available ? clinical.notes : null;
+    for (var i = 0; i < 7; i++) {
+      var date = addDays(monday, i), dow = (i + 1) % 7, ev = [];
+      plan.forEach(function (a) {
+        a.slots.forEach(function (s) {
+          if (s.day !== dow) return;
+          ev.push({ date: date, start: s.start, end: s.end, note: s.note, case_id: a.case_id, student: a.student, provider: a.provider, providerKey: a.providerKey,
+            role: a.role, open: a.open, overlaps: [], noteState: '' });
+        });
+      });
+      ev.forEach(function (e, j) {
+        ev.forEach(function (o, k) {
+          if (k === j || o.start >= e.end || e.start >= o.end) return;
+          var sup = SUPERVISE.test(e.role + ' ' + e.note) || SUPERVISE.test(o.role + ' ' + o.note);
+          if (e.providerKey && e.providerKey === o.providerKey && o.case_id !== e.case_id && !sup) e.overlaps.push({ kind: 'provider', with: o.student, time: timeRange(o) });
+          else if (o.case_id === e.case_id && !sup && !e.open && !o.open && e.providerKey !== o.providerKey) e.overlaps.push({ kind: 'student', with: o.provider + ' (' + o.role + ')', time: timeRange(o) });
+        });
+        if (notes && date < today && !e.open) {
+          var hit = notes.some(function (n) { return n.case_id === e.case_id && n.date === date && (!e.providerKey || n.providerKey === e.providerKey); });
+          e.noteState = hit ? 'on_file' : 'none';
+        }
+      });
+      var shown = ev.filter(function (e) { return (!opts.providerKey || e.providerKey === opts.providerKey) && (!opts.caseId || e.case_id === opts.caseId); })
+        .sort(function (a, b) { return a.start - b.start || (a.student < b.student ? -1 : 1); });
+      days.push({ date: date, dow: dow, label: DAY_LABEL[dow], isToday: date === today, isPast: date < today, events: shown });
+    }
+    var scope = plan.filter(function (a) { return (!opts.providerKey || a.providerKey === opts.providerKey) && (!opts.caseId || a.case_id === opts.caseId); });
+    return { monday: monday, sunday: addDays(monday, 6), days: days,
+      offCalendar: scope.filter(function (a) { return a.unparsed.length || !a.slots.length; }).map(function (a) { return { case_id: a.case_id, student: a.student, provider: a.provider, providerKey: a.providerKey, role: a.role, open: a.open, text: a.unparsed.join('; ') || a.schedule }; }),
+      mandate: scope.filter(function (a) { return a.vsMandate === 'under' || a.vsMandate === 'over'; }),
+      // each clash is counted once, not once per side
+      overlapCount: days.reduce(function (n, d) { return n + d.events.reduce(function (m, e) { return m + e.overlaps.length; }, 0) / 2; }, 0),
+      notesAvailable: !!notes };
+  }
+  /** TTG bookings per provider (hours/week and which days). This is not their outside availability, which no source records. */
+  function providerLoad(P) {
+    var plan = weekPlan(P), out = {};
+    plan.forEach(function (a) {
+      if (!a.providerKey) return;
+      var o = out[a.providerKey] = out[a.providerKey] || { key: a.providerKey, name: a.provider, minutes: 0, days: {}, students: [] };
+      o.minutes += a.minutes; a.slots.forEach(function (s) { o.days[s.day] = 1; }); if (o.students.indexOf(a.student) < 0) o.students.push(a.student);
+    });
+    return out;
+  }
+
   /* ---------- search + review count ---------- */
   function searchAll(q, P, clinical) {
     q = str(q).toLowerCase(); if (q.length < 2) return [];
     var out = [], has = function (s) { return String(s || '').toLowerCase().indexOf(q) >= 0; };
     (P.students || []).forEach(function (s) { if (has(s.name) || has(s.id) || has(s.services.join(' '))) out.push({ type: 'Student', href: '#/student/' + s.id, title: s.name, sub: s.services.join(' · ') || s.setting }); });
     (P.providers || []).forEach(function (p) { if (has(p.name) || has(p.roles.join(' '))) out.push({ type: 'Provider', href: '#/provider/' + p.key, title: p.name, sub: p.roles.join(' · ') }); });
-    ((clinical && clinical.notes) || []).forEach(function (n) { if (has(n.text) || has(n.provider) || has(n.service)) out.push({ type: 'Note', href: '#/note/' + n.id, title: n.student + ' · ' + n.date, sub: (n.service ? n.service + ' · ' : '') + excerpt(n.text, 80) }); });
-    (P.queue || []).forEach(function (x) { if (has(x.subject) || has(x.student) || has(x.recipient) || has(x.message)) out.push({ type: 'Open item', href: '#/item/' + x.id, title: x.subject || x.triggerName, sub: x.recipient + ' · ' + x.status }); });
+    ((clinical && clinical.notes) || []).concat((clinical && clinical.unlinked) || []).forEach(function (n) { if (has(n.text) || has(n.provider) || has(n.service) || (n.unlinked && has(n.student))) out.push({ type: n.unlinked ? 'Note (not linked)' : 'Note', href: '#/note/' + n.id, title: n.student + ' · ' + n.date, sub: (n.service ? n.service + ' · ' : '') + excerpt(n.text, 80) }); });
+    (P.queue || []).forEach(function (x) { if (has(x.subject) || has(x.student) || has(x.recipient) || has(x.message)) out.push({ type: 'Open item', href: '#/item/' + x.id, title: x.title, sub: x.recipient + ' · ' + x.status }); });
     (P.reports || []).forEach(function (r) { if (has(r.title) || has(r.scope)) out.push({ type: 'Report', href: '#/report/' + r.id, title: r.title, sub: r.status }); });
     return out.slice(0, 60);
   }
   function reviewItems(P, billing) {
     var g = queueGroups(P), out = [];
-    g.needsYou.forEach(function (x) { out.push({ kind: 'Draft message', href: '#/item/' + x.id, title: x.subject || x.triggerName, sub: x.recipient }); });
+    g.needsYou.forEach(function (x) { out.push({ kind: 'Draft message', href: '#/item/' + x.id, title: x.title, sub: x.recipient && x.title.indexOf(x.recipient) < 0 ? x.recipient : x.student }); });
     (P.reports || []).filter(function (r) { return r.status === 'draft'; }).forEach(function (r) { out.push({ kind: 'Report draft', href: '#/report/' + r.id, title: r.title, sub: r.created.slice(0, 10) }); });
     ((billing && billing.available && billing.batches) || []).filter(function (b) { return b.audit.status !== 'Signed off'; }).forEach(function (b) { out.push({ kind: 'Billing', href: '#/billing/' + encodeURIComponent(b.id), title: b.id, sub: b.audit.status }); });
     return out;
@@ -279,7 +418,9 @@
   var api = { maskSSN: maskSSN, documents: documents, caseRecords: caseRecords, EDITABLE: EDITABLE, val: val, safeUrl: safeUrl, hkey: hkey, providerIndex: providerIndex, findProvider: findProvider,
     normalizeBootstrap: normalizeBootstrap, student: student, queueGroups: queueGroups, normalizeClinical: normalizeClinical,
     filterNotes: filterNotes, noteProviders: noteProviders, buildReportDraft: buildReportDraft, searchAll: searchAll, reviewItems: reviewItems,
-    normName: normName, normService: normService };
+    normName: normName, normService: normService,
+    parseSchedule: parseSchedule, weekPlan: weekPlan, calendarWeek: calendarWeek, providerLoad: providerLoad, weekStart: weekStart, addDays: addDays,
+    timeRange: timeRange, fmtHours: fmtHours, mandateMinutes: mandateMinutes, slotMinutes: slotMinutes, DAY_LABEL: DAY_LABEL };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.TTG_V4_MODEL = api;
 })(typeof window !== 'undefined' ? window : this);
