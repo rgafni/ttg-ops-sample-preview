@@ -84,7 +84,8 @@ test('student preview: exactly seven sections, only fields the live API really s
   const a = t.app.S.P.students.find(x => x.name === 'Avery Demo'); await t.go('#/student/' + a.id); await flush();
   const sections = [...t.html.matchAll(/data-section="([^"]+)"/g)].map(x => x[1]);
   assert.deepStrictEqual(sections, ['Child info', 'Cases', 'Providers', 'Schedule', 'Billing', 'Documents', 'Clinical Data']);
-  assert.match(t.html,/Record ID/); assert.match(t.html,/case numbers, rates and full authorization details are not connected/);
+  assert.match(t.html,/Record ID/); assert.match(t.html,/Rates and full authorization details are not connected/);
+  assert.doesNotMatch(t.html,/Case #|Case number|case numbers/i);
   assert.doesNotMatch(t.html,/DEMO-CASE|DEMO-OSIS|<dt>OSIS<|<dt>Rate</);
   assert.doesNotMatch(t.html.replace(/<details[\s\S]*?<\/details>/g,''),/Hours &amp; key dates|Hours & key dates|Not on file|Last contact:/);
   assert.doesNotMatch(t.html,/data-act="bill-|data-change="bill-check"/);
